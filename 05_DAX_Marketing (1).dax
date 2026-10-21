@@ -1,0 +1,174 @@
+-- =====================================================================
+-- DAX: Marketing / Customer Personality project
+-- RELATIONSHIPS (Model view, all 1-to-many, single direction):
+--   DimCustomer[CustomerID] --> FactSpend[CustomerID]
+--   DimCustomer[CustomerID] --> FactChannel[CustomerID]
+--   DimCustomer[CustomerID] --> FactCampaign[CustomerID]
+--   DimDate[Date]           --> DimCustomer[EnrollmentDate]
+-- SORT BY COLUMN (Column tools > Sort by column):
+--   DimCustomer[AgeGroup] by AgeGroupOrder
+--   DimCustomer[IncomeBand] by IncomeBandOrder
+--   DimCustomer[Education] by EducationOrder
+--   FactCampaign[CampaignLabel] by CampaignNo
+--   DimDate[YearMonth] by Date  (or use DimDate[Date] on the axis)
+-- Create an empty table "_Measures" and put all measures in it.
+-- Currency is not stated in the source data, so labels say "Spend".
+-- =====================================================================
+
+
+-- ---------------------------------------------------------------------
+-- A) CALCULATED COLUMNS on DimCustomer (New column, one at a time)
+-- ---------------------------------------------------------------------
+
+-- Share of customers at or below this customer's value (0 to 1)
+R Score =
+VAR v = DimCustomer[Recency]
+VAR p = DIVIDE ( COUNTROWS ( FILTER ( ALL ( DimCustomer ), DimCustomer[Recency] <= v ) ), COUNTROWS ( ALL ( DimCustomer ) ) )
+RETURN SWITCH ( TRUE (), p <= 0.25, 4, p <= 0.5, 3, p <= 0.75, 2, 1 )   -- recent = high score
+
+F Score =
+VAR v = DimCustomer[TotalPurchases]
+VAR p = DIVIDE ( COUNTROWS ( FILTER ( ALL ( DimCustomer ), DimCustomer[TotalPurchases] <= v ) ), COUNTROWS ( ALL ( DimCustomer ) ) )
+RETURN SWITCH ( TRUE (), p > 0.75, 4, p > 0.5, 3, p > 0.25, 2, 1 )
+
+M Score =
+VAR v = DimCustomer[TotalSpend]
+VAR p = DIVIDE ( COUNTROWS ( FILTER ( ALL ( DimCustomer ), DimCustomer[TotalSpend] <= v ) ), COUNTROWS ( ALL ( DimCustomer ) ) )
+RETURN SWITCH ( TRUE (), p > 0.75, 4, p > 0.5, 3, p > 0.25, 2, 1 )
+
+-- Sort helper for RFM Segment. Built from the scores (NOT from RFM Segment) to avoid a circular reference.
+RFM Segment Order =
+VAR FMScore = ( DimCustomer[F Score] + DimCustomer[M Score] ) / 2
+VAR R = DimCustomer[R Score]
+RETURN
+    SWITCH (
+        TRUE (),
+        R >= 3 && FMScore >= 3, 1,
+        R < 3  && FMScore >= 3, 2,
+        R >= 3 && FMScore < 3,  3,
+        4
+    )
+
+Recency Bucket =
+SWITCH (
+    TRUE (),
+    DimCustomer[Recency] < 30, "0-29 days",
+    DimCustomer[Recency] < 60, "30-59 days",
+    "60+ days"
+)   -- sorts correctly in alphabetical order
+
+RFM Segment =
+VAR FMScore = ( DimCustomer[F Score] + DimCustomer[M Score] ) / 2
+VAR R = DimCustomer[R Score]
+RETURN
+    SWITCH (
+        TRUE (),
+        R >= 3 && FMScore >= 3, "Champions",
+        R < 3  && FMScore >= 3, "At-Risk High Value",
+        R >= 3 && FMScore < 3,  "Promising",
+        "Dormant"
+    )
+
+
+-- ---------------------------------------------------------------------
+-- B) CUSTOMER AND SPEND MEASURES
+-- ---------------------------------------------------------------------
+
+Customers = COUNTROWS ( DimCustomer )
+
+Total Spend = SUM ( FactSpend[Amount] )
+
+Avg Spend per Customer = DIVIDE ( [Total Spend], [Customers] )
+
+Total Purchases = SUM ( DimCustomer[TotalPurchases] )
+
+Avg Purchases per Customer = DIVIDE ( [Total Purchases], [Customers] )
+
+Spend per Purchase = DIVIDE ( SUM ( DimCustomer[TotalSpend] ), [Total Purchases] )
+
+Avg Income = AVERAGE ( DimCustomer[Income] )
+
+Avg Age = AVERAGE ( DimCustomer[Age] )
+
+Avg Recency (Days) = AVERAGE ( DimCustomer[Recency] )
+
+Avg Tenure (Days) = AVERAGE ( DimCustomer[TenureDays] )
+
+Category Share % =
+DIVIDE ( [Total Spend], CALCULATE ( [Total Spend], ALLSELECTED ( FactSpend[Category] ) ) )
+
+Spend Share of All % =
+DIVIDE ( [Total Spend], CALCULATE ( [Total Spend], ALL ( DimCustomer ), ALL ( DimDate ) ) )
+
+Champions Spend Share % =
+DIVIDE (
+    CALCULATE ( [Total Spend], DimCustomer[RFM Segment] = "Champions" ),
+    CALCULATE ( [Total Spend], ALLSELECTED ( DimCustomer ) )
+)
+
+
+-- ---------------------------------------------------------------------
+-- C) CAMPAIGN MEASURES
+-- ---------------------------------------------------------------------
+
+Acceptance Rate % =
+DIVIDE ( SUM ( FactCampaign[Accepted] ), COUNTROWS ( FactCampaign ) )
+
+Total Acceptances = SUM ( FactCampaign[Accepted] )
+
+Last Campaign Response % =
+CALCULATE ( [Acceptance Rate %], FactCampaign[CampaignNo] = 6 )
+
+Earlier Campaigns Avg Rate % =
+CALCULATE ( [Acceptance Rate %], FactCampaign[CampaignNo] <= 5 )
+
+Responders (Any Campaign) =
+CALCULATE ( COUNTROWS ( DimCustomer ), DimCustomer[CampaignsAccepted] > 0 )
+
+Responder Rate % = DIVIDE ( [Responders (Any Campaign)], [Customers] )
+
+Repeat Responders (2+) =
+CALCULATE ( COUNTROWS ( DimCustomer ), DimCustomer[CampaignsAccepted] >= 2 )
+
+-- Lift vs the overall rate of the same campaign (1.0 = average)
+Response Lift =
+DIVIDE (
+    [Acceptance Rate %],
+    CALCULATE ( [Acceptance Rate %], ALL ( DimCustomer ), ALL ( DimDate ) )
+)
+
+
+-- ---------------------------------------------------------------------
+-- D) CHANNEL AND ENGAGEMENT MEASURES
+-- ---------------------------------------------------------------------
+
+Channel Purchases = SUM ( FactChannel[Purchases] )
+
+Channel Mix % =
+DIVIDE ( [Channel Purchases], CALCULATE ( [Channel Purchases], ALLSELECTED ( FactChannel[Channel] ) ) )
+
+Avg Web Visits per Month = AVERAGE ( DimCustomer[WebVisitsMonth] )
+
+-- Excludes the 3 customers whose discount purchases exceed total purchases
+Deal Purchase % =
+DIVIDE (
+    CALCULATE ( SUM ( DimCustomer[DealsPurchases] ), DimCustomer[DealsCheck] = "OK" ),
+    CALCULATE ( SUM ( DimCustomer[TotalPurchases] ), DimCustomer[DealsCheck] = "OK" )
+)
+
+Complaint Rate % =
+DIVIDE ( CALCULATE ( COUNTROWS ( DimCustomer ), DimCustomer[Complain] = 1 ), [Customers] )
+
+
+-- ---------------------------------------------------------------------
+-- E) GROWTH AND TITLES
+-- ---------------------------------------------------------------------
+
+New Customers = [Customers]   -- use with DimDate[YearMonth] on the axis
+
+Report Title Suffix =
+IF (
+    ISFILTERED ( DimDate[Year] ),
+    "Enrolled " & MIN ( DimDate[Year] ) & " to " & MAX ( DimDate[Year] ),
+    "All customers (Jul 2012 to Jun 2014 enrollments)"
+)
